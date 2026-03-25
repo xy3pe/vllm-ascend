@@ -454,6 +454,103 @@ class NPUWorker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+        # Initialize CPU memory for release KV cache offloading
+        self._init_release_cpu_caches()
+
+    def _init_release_cpu_caches(self) -> None:
+        """Initialize CPU pinned memory for release KV cache offloading."""
+        num_release_cpu_blocks = (
+            self.cache_config.num_release_cpu_blocks
+        )
+        if not num_release_cpu_blocks or num_release_cpu_blocks <= 0:
+            self._release_cpu_caches: list[torch.Tensor] = []
+            return
+
+        pin_memory = torch.npu.is_available()
+        self._release_cpu_caches = []
+        for npu_tensor in self.model_runner.kv_caches:
+            cpu_shape = list(npu_tensor.shape)
+            # For shape (2, num_blocks, ...), dim 1 is num_blocks
+            # For shape (num_blocks, ...), dim 0 is num_blocks
+            if npu_tensor.dim() >= 2 and npu_tensor.shape[0] == 2:
+                cpu_shape[1] = num_release_cpu_blocks
+            else:
+                cpu_shape[0] = num_release_cpu_blocks
+            cpu_tensor = torch.zeros(
+                cpu_shape,
+                dtype=npu_tensor.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            self._release_cpu_caches.append(cpu_tensor)
+        logger.info(
+            "Allocated %d CPU tensors with %d blocks each for "
+            "release KV cache offloading",
+            len(self._release_cpu_caches),
+            num_release_cpu_blocks,
+        )
+
+    def offload_release_blocks(
+        self,
+        transfer_specs: list[tuple[list[int], list[int], list]],
+    ) -> None:
+        """Copy KV cache blocks from NPU to CPU pinned memory.
+
+        Args:
+            transfer_specs: List of (npu_block_ids, cpu_block_ids,
+                            block_hashes) tuples.
+        """
+        if not self._release_cpu_caches:
+            logger.warning(
+                "Release CPU caches not initialized, skipping offload"
+            )
+            return
+
+        for npu_block_ids, cpu_block_ids, _ in transfer_specs:
+            if not npu_block_ids or not cpu_block_ids:
+                continue
+            num_blocks = min(len(npu_block_ids), len(cpu_block_ids))
+            block_mapping = torch.tensor(
+                [[npu_block_ids[i], cpu_block_ids[i]]
+                 for i in range(num_blocks)],
+                dtype=torch.int64,
+            )
+            for npu_cache, cpu_cache in zip(
+                self.model_runner.kv_caches, self._release_cpu_caches
+            ):
+                torch.ops._C_ascend.swap_blocks(
+                    npu_cache, cpu_cache, block_mapping)
+
+    def load_release_blocks(
+        self,
+        transfer_specs: list[tuple[list[int], list[int]]],
+    ) -> None:
+        """Copy KV cache blocks from CPU pinned memory back to NPU.
+
+        Args:
+            transfer_specs: List of (cpu_block_ids, npu_block_ids) tuples.
+        """
+        if not self._release_cpu_caches:
+            logger.warning(
+                "Release CPU caches not initialized, skipping load"
+            )
+            return
+
+        for cpu_block_ids, npu_block_ids in transfer_specs:
+            if not cpu_block_ids or not npu_block_ids:
+                continue
+            num_blocks = min(len(cpu_block_ids), len(npu_block_ids))
+            block_mapping = torch.tensor(
+                [[cpu_block_ids[i], npu_block_ids[i]]
+                 for i in range(num_blocks)],
+                dtype=torch.int64,
+            )
+            for cpu_cache, npu_cache in zip(
+                self._release_cpu_caches, self.model_runner.kv_caches
+            ):
+                torch.ops._C_ascend.swap_blocks(
+                    cpu_cache, npu_cache, block_mapping)
+
     def profile(self, is_start: bool = True):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
