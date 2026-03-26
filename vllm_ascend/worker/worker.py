@@ -493,6 +493,28 @@ class NPUWorker(WorkerBase):
             num_release_cpu_blocks,
         )
 
+    def _compute_block_checksums(
+        self,
+        cache_tuple: tuple[torch.Tensor, ...],
+        block_ids: list[int],
+        label: str,
+    ) -> None:
+        """Compute and log per-block checksums for verification.
+
+        NPU kv_caches elements are tuples (k, v[, dsa_k]).
+        """
+        for part_idx, t in enumerate(cache_tuple):
+            part_name = ["k", "v", "dsa_k"][part_idx] if part_idx < 3 \
+                else f"part{part_idx}"
+            for block_id in block_ids:
+                # dim 0 is num_blocks for each sub-tensor
+                block_data = t[block_id]
+                checksum = block_data.to(torch.float32).sum().item()
+                logger.info(
+                    "checksum %s %s block_id=%d: %.6f",
+                    label, part_name, block_id, checksum,
+                )
+
     def offload_release_blocks(
         self,
         transfer_specs: list[tuple[list[int], list[int], list]],
@@ -509,6 +531,8 @@ class NPUWorker(WorkerBase):
             )
             return
 
+        do_checksum = self.cache_config.release_offload_checksum
+
         for npu_block_ids, cpu_block_ids, _ in transfer_specs:
             if not npu_block_ids or not cpu_block_ids:
                 continue
@@ -522,13 +546,23 @@ class NPUWorker(WorkerBase):
                  for i in range(num_blocks)],
                 dtype=torch.int64,
             )
-            for npu_kv, cpu_kv in zip(
+            for layer_idx, (npu_kv, cpu_kv) in enumerate(zip(
                 self.model_runner.kv_caches, self._release_cpu_caches
-            ):
+            )):
+                if do_checksum:
+                    self._compute_block_checksums(
+                        npu_kv, npu_block_ids[:num_blocks],
+                        f"offload_src_npu_layer{layer_idx}",
+                    )
                 # npu_kv / cpu_kv are tuples: (k, v[, dsa_k])
                 for npu_t, cpu_t in zip(npu_kv, cpu_kv):
                     torch.ops._C_ascend.swap_blocks(
                         npu_t, cpu_t, block_mapping)
+                if do_checksum:
+                    self._compute_block_checksums(
+                        cpu_kv, cpu_block_ids[:num_blocks],
+                        f"offload_dst_cpu_layer{layer_idx}",
+                    )
 
     def load_release_blocks(
         self,
@@ -545,6 +579,8 @@ class NPUWorker(WorkerBase):
             )
             return
 
+        do_checksum = self.cache_config.release_offload_checksum
+
         for cpu_block_ids, npu_block_ids in transfer_specs:
             if not cpu_block_ids or not npu_block_ids:
                 continue
@@ -558,13 +594,23 @@ class NPUWorker(WorkerBase):
                  for i in range(num_blocks)],
                 dtype=torch.int64,
             )
-            for cpu_kv, npu_kv in zip(
+            for layer_idx, (cpu_kv, npu_kv) in enumerate(zip(
                 self._release_cpu_caches, self.model_runner.kv_caches
-            ):
+            )):
+                if do_checksum:
+                    self._compute_block_checksums(
+                        cpu_kv, cpu_block_ids[:num_blocks],
+                        f"load_src_cpu_layer{layer_idx}",
+                    )
                 # cpu_kv / npu_kv are tuples: (k, v[, dsa_k])
                 for cpu_t, npu_t in zip(cpu_kv, npu_kv):
                     torch.ops._C_ascend.swap_blocks(
                         cpu_t, npu_t, block_mapping)
+                if do_checksum:
+                    self._compute_block_checksums(
+                        npu_kv, npu_block_ids[:num_blocks],
+                        f"load_dst_npu_layer{layer_idx}",
+                    )
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
