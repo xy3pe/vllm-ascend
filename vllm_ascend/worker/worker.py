@@ -513,6 +513,10 @@ class NPUWorker(WorkerBase):
             if not npu_block_ids or not cpu_block_ids:
                 continue
             num_blocks = min(len(npu_block_ids), len(cpu_block_ids))
+            logger.info(
+                "offload_release_blocks: swapping %d blocks "
+                "NPU->CPU", num_blocks,
+            )
             block_mapping = torch.tensor(
                 [[npu_block_ids[i], cpu_block_ids[i]]
                  for i in range(num_blocks)],
@@ -545,6 +549,10 @@ class NPUWorker(WorkerBase):
             if not cpu_block_ids or not npu_block_ids:
                 continue
             num_blocks = min(len(cpu_block_ids), len(npu_block_ids))
+            logger.info(
+                "load_release_blocks: swapping %d blocks "
+                "CPU->NPU", num_blocks,
+            )
             block_mapping = torch.tensor(
                 [[cpu_block_ids[i], npu_block_ids[i]]
                  for i in range(num_blocks)],
