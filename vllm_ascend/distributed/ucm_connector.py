@@ -214,6 +214,35 @@ class UCMConnectorV1(KVConnectorBase_V1):
         """
         return self._ucm_engine.request_finished(request, block_ids)
 
+    def notify_release(
+        self,
+        block_hashes: list,
+        gpu_block_ids: list[int],
+    ) -> int:
+        """Store released blocks to UCM.
+
+        Called by scheduler when release_kv_cache API is invoked.
+        Delegates to the underlying UCM engine which will include
+        these blocks in the next build_connector_meta() dump cycle.
+
+        Args:
+            block_hashes: block hashes of released blocks.
+            gpu_block_ids: corresponding GPU/NPU block IDs.
+
+        Returns:
+            Number of blocks accepted for storage.
+        """
+        if hasattr(self._ucm_engine, 'notify_release'):
+            return self._ucm_engine.notify_release(
+                block_hashes, gpu_block_ids
+            )
+        logger.warning(
+            "UCM engine does not support notify_release, "
+            "skipping release offload for %d blocks",
+            len(gpu_block_ids),
+        )
+        return 0
+
     # ==============================
     # Metrics & Stats
     # ==============================
